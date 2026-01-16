@@ -16,8 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from .env file in the script's directory
+# (not CWD, which may differ when run via MCP)
+script_dir = Path(__file__).parent.resolve()
+env_path = script_dir / '.env'
+load_dotenv(env_path, override=True)
+logger.info(f"Loaded environment from: {env_path}")
 
 # Initialize MCP server
 mcp = FastMCP("jmeter")
@@ -68,14 +72,48 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
                 logger.debug(f"Adding property: -J{prop_name}={prop_value}")
         
         # Add report generation options if requested
-        if generate_report and non_gui:
-            if log_file is None:
-                # Generate unique log file name if not specified
+        # Get default output directory from environment
+        output_dir = os.getenv('JMETER_OUTPUT_DIR', '')
+        
+        # Resolve output_dir if it's a relative path (e.g., ./JMeterResults)
+        # Use script directory as base, not CWD
+        if output_dir and not os.path.isabs(output_dir):
+            output_dir = str((script_dir / output_dir).resolve())
+            logger.debug(f"Resolved relative JMETER_OUTPUT_DIR to: {output_dir}")
+        
+        # Ensure output directory exists (auto-create if needed)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+            logger.info(f"Created output directory: {output_dir}")
+        
+        # Helper function to resolve paths against output directory
+        def resolve_output_path(filepath: str) -> str:
+            if not filepath:
+                return filepath
+            # If already absolute, use as-is
+            if os.path.isabs(filepath):
+                return filepath
+            # If output_dir is configured, join with it
+            if output_dir:
+                return os.path.join(output_dir, filepath)
+            # Otherwise, use as-is (relative to CWD)
+            return filepath
+        
+        # Add log file if provided or if generating report
+        if non_gui:
+            if log_file:
+                resolved_log_file = resolve_output_path(log_file)
+                cmd.extend(['-l', resolved_log_file])
+                logger.info(f"Log file will be written to: {resolved_log_file}")
+            elif generate_report:
+                # Generate unique log file name if not specified but report is requested
                 unique_id = generate_unique_id()
                 log_file = f"{test_file_path.stem}_{unique_id}_results.jtl"
                 logger.debug(f"Using generated unique log file: {log_file}")
-            
-            cmd.extend(['-l', log_file])
+                cmd.extend(['-l', log_file])
+
+        # Add report generation options if requested
+        if generate_report and non_gui:
             cmd.extend(['-e'])
             
             # Always ensure report_output_dir is unique
@@ -90,15 +128,34 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
                 # Generate unique report output directory if not specified
                 report_output_dir = f"{test_file_path.stem}_{unique_id}_report"
                 logger.debug(f"Using generated unique report output directory: {report_output_dir}")
-                
-            cmd.extend(['-o', report_output_dir])
+            
+            # Resolve report directory against output_dir
+            resolved_report_dir = resolve_output_path(report_output_dir)
+            cmd.extend(['-o', resolved_report_dir])
+            logger.info(f"Report will be written to: {resolved_report_dir}")
 
         # Log the full command for debugging
         logger.debug(f"Executing command: {' '.join(cmd)}")
         
+        # Force set JAVA_HOME and PATH to ensure subprocess sees it (Applies to both GUI and Non-GUI)
+        # Force set JAVA_HOME and PATH to ensure subprocess sees it (Applies to both GUI and Non-GUI)
+        env = os.environ.copy()
+        
+        # Use JAVA_HOME from environment (loaded from .env)
+        java_home = os.getenv('JAVA_HOME')
+        if java_home:
+            env['JAVA_HOME'] = java_home
+            env['PATH'] = f"{java_home}\\bin;{env.get('PATH', '')}"
+            logger.info(f"Using JAVA_HOME: {java_home}")
+        else:
+            logger.warning("JAVA_HOME not set in environment! JMeter might fail.")
+            
+        if 'JMETER_BIN' in env:
+            del env['JMETER_BIN'] # Prevent conflict with batch file's internal JMETER_BIN variable
+
         if non_gui:
             # For non-GUI mode, capture output
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, shell=True)
             
             # Log output for debugging
             logger.debug("Command output:")
@@ -111,8 +168,9 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
             
             return result.stdout
         else:
-            # For GUI mode, start process without capturing output
-            subprocess.Popen(cmd)
+            # For GUI mode, start process with patched environment
+            # shell=True and strict detachment are crucial for Windows GUI apps invoked from background services
+            subprocess.Popen(cmd, env=env, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return "JMeter GUI launched successfully"
 
     except Exception as e:
